@@ -9,7 +9,8 @@ import monitor
 import registry
 from evidence import PROFILE_MARK, UNVERIFIED
 from research_agent import (KEY_NAMES, MODES, PROFILE_MAX_CHARS, QuotaExceededError, ResearchResult, error_message,
-                            format_duration, key_source, missing_keys, research, save_keys_to_env, use_api_keys)
+                            check_keys, format_duration, key_source, log_failure, missing_keys, research, save_keys_to_env,
+                            use_api_keys)
 
 PROFILE_PLACEHOLDER = ('例如：GNTC 是一家……（公司簡介）\n主要服務：……\n目標客戶：……\n'
                        '優勢與資源：講師、合作夥伴、既有客戶……\n限制：預算、團隊規模……\n目標：例如一年內……')
@@ -117,6 +118,7 @@ def run_research(topic, company_profile='', mode='market'):
     st.session_state.pop('result', None)
     started_at = datetime.now()
     bar = st.progress(0, text='準備研究')
+    result = failure = None
     with st.status(f'正在進行{MODES[mode]}', expanded=True) as status:
         def progress(value, message):
             bar.progress(value, text=message)
@@ -126,21 +128,28 @@ def run_research(topic, company_profile='', mode='market'):
             with use_api_keys(entered_keys()):
                 result = research(topic, progress=progress, company_profile=company_profile, mode=mode)
         except Exception as exc:
-            finished_at = datetime.now()
-            message = error_message(exc)
+            failure = exc
+        finished_at = datetime.now()
+        if failure is None:
+            bar.progress(100, text='研究完成')
+            status.update(label=f'研究完成（執行 {format_duration(result.duration_seconds)}）', state='complete',
+                          expanded=False)
+        else:
             bar.empty()
             status.update(label=f'研究失敗（執行 {format_duration((finished_at - started_at).total_seconds())}）',
-                          state='error')
-            st.error(message)
-            save_history(topic, 'failed', started_at, finished_at, error=message, company_profile=company_profile,
-                         mode=mode)
-            return
-        finished_at = datetime.now()
-        st.session_state.update(result=result, topic=topic, finished_at=finished_at, company_profile=company_profile,
-                                mode=mode)
-        bar.progress(100, text='研究完成')
-        status.update(label=f'研究完成（執行 {format_duration(result.duration_seconds)}）', state='complete',
-                      expanded=False)
+                          state='error', expanded=False)
+    if failure is not None:
+        message = error_message(failure)
+        log_failure(failure, entered_keys())
+        # Shown outside the status box so it stays visible (and copyable) when the box is collapsed.
+        st.error(message)
+        st.caption(f'錯誤類型：{type(failure).__name__}。可按左側欄「測試金鑰」確認金鑰是否有效；'
+                   '詳細紀錄（已遮蔽金鑰）在伺服器 Logs。')
+        save_history(topic, 'failed', started_at, finished_at, error=message, company_profile=company_profile,
+                     mode=mode)
+        return
+    st.session_state.update(result=result, topic=topic, finished_at=finished_at, company_profile=company_profile,
+                            mode=mode)
     save_history(topic, 'success', started_at, finished_at, result=result, company_profile=company_profile, mode=mode)
 
 
@@ -331,6 +340,7 @@ def run_monitor_updates(competitors):
                 messages.append(('error', f'{competitor["name"]}：{error_message(exc)} 其餘競品未更新。'))
                 break
             except Exception as exc:
+                log_failure(exc, entered_keys())
                 status.update(label=f'{competitor["name"]}：失敗', state='error')
                 messages.append(('error', f'{competitor["name"]}：{error_message(exc)}'))
             else:
@@ -425,6 +435,11 @@ with st.sidebar:
     for name in KEY_NAMES:
         source = key_source(name, entered_keys())
         st.write(f'✅ {name}（{SOURCE_TEXT[source]}）' if source else f'❌ {name}（未設定）')
+    if st.button('測試金鑰', key='check_keys', disabled=len(missing) == len(KEY_NAMES),
+                 help='Gemini 只查詢模型清單（不消耗額度）；Tavily 會執行一次搜尋（使用 1 次搜尋額度）。'):
+        with st.spinner('測試中…'):
+            for name, (ok, message) in check_keys(entered_keys()).items():
+                (st.success if ok else st.error if ok is False else st.warning)(f'{name}：{message}')
     if CLOUD:
         # On a shared server a saved key would become every visitor's default key.
         st.caption('雲端版不提供「儲存到 .env」；填寫的金鑰只在這次瀏覽中使用。')

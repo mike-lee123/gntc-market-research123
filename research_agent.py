@@ -4,12 +4,14 @@ import os
 import re
 import threading
 import time
+import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
 
+import httpx
 from dotenv import load_dotenv, set_key
 
 import evidence
@@ -284,6 +286,64 @@ def _patch_llm_text_output():
     GenericLLMProvider._gntc_text_patch = True
 
 
+_KEY_LIKE = re.compile(r'(AIza|AQ\.|tvly-|sk-)[\w.\-]{8,}')
+
+
+def redact(text, overrides=None):
+    """Remove API keys (entered, from the environment, or key-shaped strings) from text before logging it."""
+    for value in [*(overrides or {}).values(), *(os.getenv(key, '') for key in KEY_NAMES)]:
+        if value and value.strip() and len(value.strip()) >= 8:
+            text = text.replace(value.strip(), '***')
+    return _KEY_LIKE.sub('***', text)
+
+
+def log_failure(exc, overrides=None):
+    """Write the traceback, with keys masked, to the server log (e.g. Streamlit Cloud → Manage app → Logs)."""
+    details = redact(''.join(traceback.format_exception(exc)), overrides)
+    logging.getLogger('gntc').error('研究失敗（%s）\n%s', type(exc).__name__, details)
+
+
+KEY_CHECK_TIMEOUT = 20
+
+
+def check_keys(overrides=None):
+    """Check each key with one small request. Returns {key name: (ok, message)}; ok is None when undetermined.
+
+    Gemini: lists models (no generation, no quota use). Tavily: one basic search (uses 1 search credit).
+    """
+    def value(key):
+        entered = (overrides or {}).get(key) or ''
+        return entered.strip() if _usable(entered) else (os.getenv(key) or '').strip()
+
+    def outcome(status):
+        if status == 200:
+            return True, '有效'
+        if status in (400, 401, 403):
+            return False, '金鑰無效或沒有權限，請重新複製貼上（注意前後空格）'
+        if status in (429, 432, 433):
+            return False, '金鑰有效，但額度已用完或請求過多'
+        return None, f'無法確認（服務回應 HTTP {status}）'
+
+    results = {}
+    requests = {
+        'GOOGLE_API_KEY': lambda key: httpx.get('https://generativelanguage.googleapis.com/v1beta/models',
+                                                params={'pageSize': 1}, headers={'x-goog-api-key': key},
+                                                timeout=KEY_CHECK_TIMEOUT),
+        'TAVILY_API_KEY': lambda key: httpx.post('https://api.tavily.com/search',
+                                                 json={'query': 'Taiwan', 'max_results': 1},
+                                                 headers={'Authorization': f'Bearer {key}'}, timeout=KEY_CHECK_TIMEOUT),
+    }
+    for key in KEY_NAMES:
+        if not _usable(value(key)):
+            results[key] = (False, '未設定')
+            continue
+        try:
+            results[key] = outcome(requests[key](value(key)).status_code)
+        except httpx.HTTPError:
+            results[key] = (None, '無法連線到服務，請檢查網路')
+    return results
+
+
 def error_message(exc):
     # Do not echo provider exception text: it can contain credentials/request headers.
     if isinstance(exc, QuotaExceededError):
@@ -291,7 +351,9 @@ def error_message(exc):
         return (f'Gemini 免費額度已用完（每日請求上限），請於{wait}再試。'
                 '也可到 Google AI Studio 啟用付費方案，或在 .env 改用其他模型。')
     if isinstance(exc, ResearchDataError):
-        return '未取得可用的網路來源或研究報告。請縮小研究範圍，確認 Tavily 搜尋額度後重試。'
+        # GPT Researcher turns an invalid Tavily key into "no sources", so a bad key is the first suspect.
+        return ('未取得可用的網路來源或研究報告。請先按左側欄「測試金鑰」確認 Tavily 金鑰有效且有額度，'
+                '再縮小研究範圍後重試。')
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
         return '研究超時，請縮小主題後再試；已發出的 API 請求仍會計入額度。'
     status = getattr(exc, 'status_code', None)

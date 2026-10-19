@@ -128,6 +128,44 @@ class ResearchTests(unittest.TestCase):
                 raise RuntimeError('research failed')
             self.assertNotIn('TAVILY_API_KEY', os.environ)  # restored even when the run fails
 
+    def test_redact_and_log_failure(self):
+        with patch.dict(os.environ, {'GOOGLE_API_KEY': 'env-google-123456', 'TAVILY_API_KEY': ''}):
+            text = agent.redact('a env-google-123456 b typed-key-987654 c AIzaSyABCDEFGHIJ d tvly-dev-abcdefghij',
+                                {'TAVILY_API_KEY': 'typed-key-987654'})
+            self.assertEqual(text, 'a *** b *** c *** d ***')
+            try:
+                raise RuntimeError('failed with env-google-123456')
+            except RuntimeError as exc:
+                with self.assertLogs('gntc', 'ERROR') as logs:
+                    agent.log_failure(exc)
+            self.assertIn('研究失敗（RuntimeError）', logs.output[0])
+            self.assertIn('Traceback', logs.output[0])
+            self.assertNotIn('env-google-123456', logs.output[0])
+
+    def test_check_keys(self):
+        def response(status):
+            r = MagicMock()
+            r.status_code = status
+            return r
+        with patch.dict(os.environ, {'GOOGLE_API_KEY': 'env-google', 'TAVILY_API_KEY': ''}), \
+                patch.object(agent.httpx, 'get', return_value=response(200)) as get, \
+                patch.object(agent.httpx, 'post', return_value=response(401)) as post:
+            results = agent.check_keys({'TAVILY_API_KEY': ' tvly-typed '})
+        self.assertEqual(results['GOOGLE_API_KEY'], (True, '有效'))
+        self.assertFalse(results['TAVILY_API_KEY'][0])
+        self.assertIn('金鑰無效', results['TAVILY_API_KEY'][1])
+        self.assertEqual(get.call_args.kwargs['headers'], {'x-goog-api-key': 'env-google'})
+        self.assertEqual(post.call_args.kwargs['headers'], {'Authorization': 'Bearer tvly-typed'})
+        with patch.dict(os.environ, {'GOOGLE_API_KEY': '', 'TAVILY_API_KEY': 'tvly-env'}), \
+                patch.object(agent.httpx, 'post', return_value=response(432)), \
+                patch.object(agent.httpx, 'get', side_effect=agent.httpx.ConnectError('x')):
+            results = agent.check_keys()
+        self.assertEqual(results['GOOGLE_API_KEY'], (False, '未設定'))
+        self.assertIn('額度已用完', results['TAVILY_API_KEY'][1])
+        with patch.dict(os.environ, {'GOOGLE_API_KEY': 'g', 'TAVILY_API_KEY': ''}), \
+                patch.object(agent.httpx, 'get', side_effect=agent.httpx.ConnectError('x')):
+            self.assertEqual(agent.check_keys()['GOOGLE_API_KEY'], (None, '無法連線到服務，請檢查網路'))
+
     def test_gemini_content_blocks_to_text(self):
         blocks = [{'type': 'text', 'text': '{"server": '}, {'type': 'thinking', 'thinking': 'x'}, '"agent"}']
         self.assertEqual(agent._as_text(blocks), '{"server": "agent"}')
@@ -353,6 +391,25 @@ class DashboardTests(TempHistoryMixin, unittest.TestCase):
             self.assertEqual(seen, {'GOOGLE_API_KEY': 'AIza-session', 'TAVILY_API_KEY': 'tvly-session'})
             self.assertEqual(os.environ['GOOGLE_API_KEY'], '')  # restored after the run
             self.assertFalse(any('AIza-session' in m.value for m in app.markdown))
+
+    @patch.dict(os.environ, KEYS)
+    def test_failure_shown_outside_status_and_key_check_button(self):
+        app = self.app().run()
+        with patch('research_agent.research', side_effect=agent.ResearchDataError('no sources')):
+            app.text_area[0].set_value('進口二手車及事故車鑑定')
+            app.button[0].click().run()
+        self.assertFalse(app.exception)
+        status = app.get('expandable')[0] if app.get('expandable') else None
+        self.assertIn('測試金鑰', app.error[0].value)
+        self.assertTrue(any('錯誤類型：ResearchDataError' in c.value for c in app.caption))
+        if status is not None:  # the message is not inside the (collapsed) status box
+            self.assertNotIn('測試金鑰', str(status.proto))
+        with patch('research_agent.check_keys', return_value={'GOOGLE_API_KEY': (True, '有效'),
+                                                              'TAVILY_API_KEY': (False, '金鑰無效或沒有權限')}) as check:
+            app.button(key='check_keys').click().run()
+        check.assert_called_once()
+        self.assertTrue(any('GOOGLE_API_KEY：有效' in s.value for s in app.sidebar.success))
+        self.assertTrue(any('TAVILY_API_KEY：金鑰無效或沒有權限' in e.value for e in app.sidebar.error))
 
     @patch.dict(os.environ, dict(KEYS, APP_PASSWORD='s3cret'))
     def test_password_gate(self):

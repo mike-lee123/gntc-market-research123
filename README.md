@@ -86,7 +86,8 @@ Register-ScheduledTask -TaskName 'GNTC Competitor Monitor' -Action $action -Trig
 
 雲端版的限制：
 - 根層級 Secrets 會成為環境變數；`app.py` 也會把 `GOOGLE_API_KEY`、`TAVILY_API_KEY`、`APP_PASSWORD`、`GNTC_CLOUD` 從 `st.secrets` 複製到環境變數（已存在的不覆蓋）。
-- 設定 `APP_PASSWORD` 後需輸入密碼才能使用（以 `hmac.compare_digest` 比對）。公開網址沒有密碼時，任何人都能用掉 Secrets 裡的 API 額度。
+- 設定 `APP_PASSWORD` 後需輸入密碼才能使用（以 `hmac.compare_digest` 比對）。公開網址沒有密碼時，任何人都能用掉 Secrets 裡的 API 額度；不設密碼時建議 Secrets 不放金鑰，讓使用者在左側欄填自己的金鑰。
+- 排查失敗：研究失敗時，錯誤訊息與錯誤類型顯示在狀態框外；完整 traceback（金鑰已遮蔽）寫入伺服器 Logs（Manage app → Logs）。左側欄「測試金鑰」：Gemini 只查詢模型清單（不耗額度），Tavily 執行一次搜尋（使用 1 次搜尋額度）。GPT Researcher 遇到無效的 Tavily 金鑰不會報錯，只會「找不到來源」，所以「未取得可用的網路來源」時請先測試金鑰。
 - `GNTC_CLOUD = "1"` 時停用「儲存到 .env」（共用伺服器上會變成所有訪客的預設金鑰），並在側欄提示資料是暫存的。
 - 檔案系統是暫存的：App 閒置休眠、重新啟動或重新部署後，SQLite 研究歷史、競品清單、公司背景會清空，需重新設定。要永久保存需改用外部資料庫（尚未實作）。
 - 沒有 Windows 排程，競品監測需手動更新；本機與雲端的資料互不相通。
